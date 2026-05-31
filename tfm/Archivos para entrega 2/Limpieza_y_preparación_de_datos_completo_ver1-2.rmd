@@ -1,0 +1,1489 @@
+---
+title: 'Limpieza y preparación de datos'
+author: "Adriana Socorro del Pozo, Llara Calvo García, Nadine March Wischniewski, Sergey Sivirilov Kabanov"
+date: "`r Sys.Date()`"
+output:
+  pdf_document: default
+  toc: true
+  toc_depth: 3
+  toc_float: true
+  number_sections: true
+  html_document: null
+  word_document: default
+editor_options:
+  markdown:
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(dplyr)
+library(readr)
+library(lubridate)
+library(stringr)
+library(zoo)
+library(ggplot2)
+library(esquisse)
+library(ggcorrplot)
+library(GGally)
+library(eurostat)
+library(tempdisagg)
+library(readxl)
+library(janitor)
+library(tempdisagg)
+```
+
+# Introducción
+
+El presente archivo documenta el proceso de preprocesamiento, limpieza y transformación de los datos.
+Para la elaboración de este proyecto se ha partido de diversas fuentes de información heterogéneas (registros climáticos, indicadores macroeconómicos, métricas turísticas y calendarios locales).
+Dada la diferente naturaleza de los datos originales, cada fuente ha sido tratada y depurada de forma individualizada, aplicando las técnicas de limpieza más adecuadas según su contenido específico y sus anomalías particulares.
+
+# Fuente de datos 1: Clima
+
+Los datos climáticos fueron obtenidos a través de la API oficial de la Agencia Estatal de Meteorología (AEMET).
+
+Se disponía de 12 datasets diferentes para cada uno de los años de nuestro periodo (2016 a 2025), más otro dataset que incluye los meses y las pernoctaciones totales de cada mes.
+
+En un principio, se valorarán las siguientes variables climáticas de estudio:
+
+-   `inso`: media diaria de horas de insolación directa despejada
+
+-   `tm_min`: promedio mensual de las temperaturas más bajas registradas diariamente (ºC)
+
+-   `tm_max`: promedio mensual de las temperaturas más altas alcanzadas cada día (ºC)
+
+-   `np_010`: número de días del mes en los que se registró una precipitación igual o superior a 1 milímetro.
+
+-   `pernoctaciones`: variable respuesta.
+    Número total de noches que los viajeros se han alojado en los establecimientos hoteleros.
+
+## 1. Cargar los datos y estructura
+
+### 1.1. Carga
+
+En primer lugar es necesario cargar los 12 datasets independientes descargados de la AEMET mediante su API y juntarlos en un único dataset.
+
+```{r}
+datasets_clima <- list.files(pattern = "Clima_Sevilla_.*\\.csv")
+df_clima_bruto <- lapply(datasets_clima, read_csv) %>% bind_rows()
+```
+
+Cargo también el dataset de pernoctaciones:
+
+```{r}
+
+df_pernoctaciones <- read_delim("Pernoctaciones_2016_2025_total .csv", 
+    delim = ";", escape_double = FALSE, trim_ws = TRUE)
+```
+
+### 1.2. Estructura de los datos
+
+Vamos a evaluar la estructura de los datos para detectar posibles anomalías en los formatos, tipos de datos incorrectos, etc.
+
+```{r}
+# 1. Vemos las primeras filas y la estructura de las variables climáticas
+head(df_clima_bruto)
+str(df_clima_bruto)
+
+# 2. Vemos las primeras filas y la estructura de la variable pernoctaciones
+head(df_pernoctaciones)
+str(df_pernoctaciones)
+```
+
+En el dataframe `df_clima_bruto` se observa que en todos los años hay una fila resumen "mes 13" (por ejemplo, 2025-13) que no nos sirve para el estudio y que es necesario eliminar.
+
+Además, el formato de fecha en los dos dataframes es diferente.
+En `df_pernoctaciones` aparece en el formato correcto (2025-01), mientra que en `df_clima_bruto` aparece sin el 0 (2025-1).
+
+Vamos a modificar el dataframe df_clima_bruto para eliminar estas filas resumen del "mes 13", dar el formato correcto a la fecha y seleccionar únicamente las variables que nos interesan:
+
+```{r}
+df_clima_limpio <- df_clima_bruto %>%
+  filter(!str_detect(fecha, "-13$")) %>% # Elimino las filas "mes 13"
+  select(fecha, tm_max, tm_min, inso, dias_lluvia = np_010) %>% 
+  mutate(fecha = format(ymd(paste0(fecha, "-1")), "%Y-%m")) # Modifico la fecha
+```
+
+También va a ser necesario modificar los nombres de las columnas del dataframe `df_pernoctaciones` para que estén el minúsculas y no haya problema a la hora de hacer el join futuro.
+
+```{r}
+names(df_pernoctaciones) <- tolower(names(df_pernoctaciones))
+```
+
+### 1.3. Unión de dataframes
+
+Una vez que tenemos los dataframes limpios y con los mismos formatos podemos unirlos usando join:
+
+```{r}
+df_maestro_clima <- df_clima_limpio %>%
+  inner_join(df_pernoctaciones, by = "fecha")
+```
+
+### 1.4. Resumen estadístico
+
+Revisamos de nuevo la estructura de este nuevo dataframe y hacemos un resumen estadístico de todas las variables:
+
+```{r}
+head(df_maestro_clima)
+str(df_maestro_clima)
+summary(df_maestro_clima)
+```
+
+Con este resumen estadístico y viendo la estructura del dataframe `df_maestro_clima` se detectan los siguientes puntos que será necesario corregir:
+
+-   NA: se observa la presencia de varios valores NA en las variables `tm_max`, `tm_min` y `inso`. El tratamiento de los NA se desarrollará en el siguiente apartado.
+
+## 2. Evaluación de la calidad de los datos
+
+### 2.1. Valores Faltantes (NAs)
+
+Como se comentó en el apartado anterior, se detectan valores NA en tres de las variables climáticas seleccionadas.
+A continuación vamos a sumar el total de NA presentes en `df_maestro_clima` para cada variable:
+
+```{r}
+colSums(is.na(df_maestro_clima))
+```
+
+-   `tm_max` presenta 3 valores NA
+
+-   `tm_min` presenta 3 valores NA
+
+-   `inso` presenta 17 valores NA
+
+Es destacable el caso de los 17 valores NA de la valiable `inso`, y prestando más atención a los datos se observa la ausencia de casi todos los valores correspondientes al año 2025.
+
+Esta falta de valores puede deberse a fallos en los sensores de medición, falta de mantenimiento y calibración o errores en la transmisión de los datos entre las estaciones climáticas y los receptores.
+
+#### 2.1.1. Tratamiento de los valores NA
+
+En el contexto de modelos predictivos, la eliminación directa de registros con valores faltantes (NA) debe considerarse siempre como último recurso, ya que provoca la pérdida de información en el resto de variables del dataset para esos meses.
+Por lo tanto, se decide aplicar técnicas de imputación adaptadas a la naturaleza y magnitud de cada ausencia de datos:
+
+-   **Valores aislados de tm_max, tm_min y inso:** en el caso de los valores nulos dispersos y de corta duración en las variables de temperatura máxima (*tm_max*, 3 registros), temperatura mínima (*tm_min*, 3 registros) y horas de sol (*inso*, 6 registros) se ha aplicado una interpolación lineal con un hueco máximo de 2 NA seguidos (`maxgap = 2`), estimando el dato faltante a partir de la tendencia natural trazada entre el mes anterior y el posterior al fallo del sensor.
+
+    ```{r}
+    df_maestro_clima <- df_maestro_clima %>%
+      mutate(tm_max = na.approx(tm_max, na.rm = FALSE, maxgap = 2),
+        tm_min = na.approx(tm_min, na.rm = FALSE, maxgap = 2),
+        inso   = na.approx(inso, na.rm = FALSE, maxgap = 2))
+    ```
+
+-   **Ausencia de valores `inso` para valores faltantes de 2025:** para este caso se opta por la técnica de Imputación Estacional, a través de la cual los valores son reemplazados por la media histórica mensual del periodo disponible (2016-2024).
+    De esta forma se mantiene la estacionalidad relacionada con esta variable por la cual los meses de invierno tienen un valor `inso` más bajo que los meses de verano.
+    Se descarta la medida de Interpolación Lineal seleccionada para los valores aislados porque resultaría ineficaz y distorsionaría la curva climática al trazar una recta anual.
+
+    ```{r}
+    df_maestro_clima <- df_maestro_clima %>%
+    mutate(mes_auxiliar = month(ymd(paste0(fecha, "-01")))) %>%
+      group_by(mes_auxiliar) %>%
+      mutate(inso = ifelse(is.na(inso), mean(inso, na.rm = TRUE), inso)) %>%
+      ungroup() %>%
+      select(-mes_auxiliar)
+    ```
+
+Revisamos la presentacia de NA tras aplicar las transformaciones:
+
+```{r}
+colSums(is.na(df_maestro_clima))
+```
+
+### 2.2. Valores Anómalos (outliers)
+
+No se detectan valores anómalos.
+
+### 2.3. Valores No válidos:
+
+No se detectan valores no válidos.
+
+### 2.4. Casos Duplicados
+
+Al tratarse de variables climáticas, la opción de que haya casos duplicados es totalmente factible.
+La única variable que no debería repetirse es la fecha.
+Comprobamos que no hay duplicados en esta variable:
+
+```{r}
+any(duplicated(df_maestro_clima$fecha))
+```
+
+# Fuente de datos 2: viajeros, grado de ocupación y llegadas al aeropuerto de Sevilla
+
+## 1. Cargar los datos y estructura
+
+### **1.1. Viajeros**
+
+Los datos turísticos fueron obtenidos del Instituto Nacional de Estadística (INE), concretamente de la operación estadística:
+
+**Hoteles: encuesta de ocupación, índice de precios e indicadores de rentabilidad**\
+
+Dentro de este proceso se descargó el conjunto de datos:
+
+-   **Viajeros y pernoctaciones por puntos turísticos**
+
+El dataset original contenía información mensual del punto turístico de Sevilla, incluyendo tanto viajeros como pernoctaciones diferenciados por tipo de residencia (residentes en España y residentes en el extranjero).
+
+Inicialmente, los datos se encontraban en formato longitudinal, donde las variables de viajeros y pernoctaciones estaban agrupadas en una misma columna categórica denominada *“Viajeros y pernoctaciones”*.
+Asimismo, los valores correspondientes a turistas nacionales e internacionales se diferenciaban mediante la variable *“Residencia”*.
+
+Para poder utilizar esta información en el análisis y en los modelos predictivos posteriores, fue necesario realizar un proceso de limpieza, transformación y estructuración de los datos con **Python en Jupyter Notebook** (**ver anexo ine_viajeros_limpio.ipynb**).
+
+En primer lugar, se importó el archivo original descargado desde el INE, especificando correctamente el separador utilizado y la codificación de caracteres, ya que el dataset contenía símbolos especiales y separadores de miles.
+
+Posteriormente, se realizó la limpieza de la variable numérica principal (`Total`), eliminando los puntos utilizados como separadores de miles y transformando los valores vacíos o representados mediante símbolos especiales en valores nulos compatibles con el tratamiento estadístico.
+
+Una vez limpiados los datos, el dataset fue transformado desde formato longitudinal a formato ancho mediante una tabla pivote.
+Este proceso permitió separar las diferentes métricas turísticas en variables independientes, obteniendo así:
+
+-   viajeros nacionales
+
+-   viajeros internacionales
+
+-   pernoctaciones nacionales
+
+-   pernoctaciones internacionales
+
+A continuación, se generaron nuevas variables agregadas calculando el total de viajeros y el total de pernoctaciones a partir de la suma de turistas nacionales e internacionales.
+
+También se realizó una transformación de la variable temporal.
+El periodo original se encontraba en formato `YYYYMmm` (por ejemplo, `2025M12`), por lo que se convirtió al formato estándar `YYYY-MM` para facilitar el análisis cronológico y la integración con el resto de datasets.
+
+Finalmente, el conjunto de datos limpio y estructurado fue exportado a un nuevo archivo CSV (**ine_viajeros_clean.csv**) preparado para su posterior integración en el dataset maestro utilizado en el análisis turístico y en los modelos de predicción.
+
+### **1.2. Grado de ocupación**
+
+El indicador de **grado de ocupación hotelera** fue obtenido del Instituto Nacional de Estadística (INE), concretamente de la operación estadística:
+
+**Establecimientos, plazas estimadas, grados de ocupación y personal empleado por puntos turísticos**
+
+Este conjunto de datos complementa la información de viajeros y pernoctaciones, ya que permite medir el nivel de saturación hotelera en cada periodo, siendo una variable clave para el análisis de la demanda turística.
+
+El dataset original presentaba ciertos problemas de estructura y consistencia, ya que los valores numéricos incluían distintos formatos (comas y puntos como separadores decimales), además de inconsistencias en la codificación del archivo.
+Por ello, fue necesario realizar un proceso de limpieza previo a su integración.
+
+En primer lugar, se llevó a cabo la lectura del archivo bruto con **Python en Jupyter Notebook** (**ver anexo ine_viajeros_ocupacion_clean.ipynb**)., adaptando el separador según el formato del fichero.
+Posteriormente, se corrigieron los valores numéricos de la variable *Total*, unificando el formato decimal y eliminando caracteres no válidos o registros vacíos que podían afectar al análisis.
+
+A continuación, la variable temporal *Periodo* fue transformada al formato estándar `YYYY-MM`, sustituyendo el formato original del INE (`YYYYMmm`) para facilitar la integración con el resto de datasets del proyecto.
+
+Una vez depurado el dataset, se conservó únicamente la variable temporal y el indicador de grado de ocupación, renombrando la variable *Total* como **grado_ocupacion** para mejorar su interpretación.
+
+Posteriormente, este dataset fue integrado con el conjunto de datos previamente construido a partir de viajeros y pernoctaciones.
+Durante este proceso, se eliminaron posibles duplicados o versiones anteriores del indicador de ocupación para garantizar la consistencia del dataset final.
+
+La unión de ambos datasets se realizó mediante la variable temporal *Periodo*, asegurando la correcta alineación de las observaciones mensuales.
+
+Finalmente, el dataset resultante fue reorganizado siguiendo una estructura coherente de variables turísticas, priorizando primero las variables agregadas (pernoctaciones, viajeros y grado de ocupación) y posteriormente las desagregadas por origen de residencia.
+
+El resultado final fue exportado como un único dataset consolidado (**ine_viajeros_ocupacion_clean.csv**) , que integra la evolución mensual del turismo en Sevilla y sirve como base para el análisis descriptivo y la modelización posterior.
+
+### **1.3 Llegadas al aeropuerto de Sevilla**
+
+Los datos de llegadas al Aeropuerto de Sevilla fueron obtenidos a través de la plataforma oficial de AENA que requiere registro.
+
+En el apartado **“Consultas personalizadas → Pasajeros/Mercancías por Compañía”**, se descargaron los datos de pasajeros internacionales que llegan al Aeropuerto de Sevilla.
+
+Para la extracción se aplicaron los siguientes filtros:
+
+-   Aeropuerto base: Sevilla
+
+-   Movimiento: Llegadas
+
+-   Tipo de tráfico: Comercial
+
+La estructura del dataset original se configuró en formato matricial, donde:
+
+-   Las filas representaban países de origen.
+
+-   Las columnas representaban meses.
+
+-   Los valores correspondían al número de pasajeros.
+
+```         
+Este formato implicaba una alta complejidad para el análisis, ya que los datos no estaban estructurados en formato temporal estándar y además el portal de AENA limita la descarga de información a intervalos de dos años, lo que obligó a construir el histórico por partes.
+
+**Problemas del dataset original**
+```
+
+El dataset descargado presentaba varias dificultades:
+
+-   Estructura en formato “wide” (países × meses), poco adecuada para análisis temporal.
+
+-   Valores numéricos con separadores de miles y formato inconsistente.
+
+-   Necesidad de reconstruir series históricas completas por tramos de años.
+
+-   Descarga fragmentada debido a las limitaciones de la plataforma de AENA.
+
+```         
+**Proceso de transformación**
+```
+
+Para resolver estos problemas, se llevó a cabo un proceso de ingeniería de datos consistente en:
+
+-   Lectura del archivo en formato texto plano debido a la estructura irregular del CSV.
+
+-   Identificación y extracción de los meses asociados a cada columna.
+
+-   Transformación de los datos desde formato matricial (país × mes) a formato longitudinal mensual.
+
+-   Agregación de los datos por país y categoría geográfica.
+
+-   Cálculo de variables derivadas:
+
+```         
+-    Llegadas nacionales (España)
+
+-    Llegadas internacionales totales
+
+-    Desagregación por países relevantes (Francia, Italia, Reino Unido, Países Bajos, Alemania)
+
+-    Cálculo del resto del mundo como categoría agregada
+```
+
+-   Generación de una serie temporal mensual coherente.
+
+```         
+**Construcción del histórico completo**
+```
+
+Dado que AENA solo permite descargas parciales de dos años, el proceso se repitió para distintos periodos temporales (2016–2017, 2018–2019, 2020–2021, 2022–2023, 2024–2025).
+
+Cada bloque fue procesado de forma independiente y posteriormente:
+
+-   Se unificaron todos los datasets en un único histórico.
+
+-   Se ordenaron cronológicamente para asegurar la continuidad temporal.
+
+-   Se verificó la consistencia de las variables entre periodos.
+
+En total, este proceso se implementó mediante **7 notebooks de Python**, correspondientes a cada bloque temporal de construcción del dataset:
+
+-   llegadas_2017_2016.ipynb
+
+-   llegadas_2019_2018.ipynb
+
+-   llegadas_2021_2020.ipynb
+
+-   llegadas_2023_2022.ipynb
+
+-   llegadas_2025_2024.ipynb
+
+-   llegadas_completo.ipynb
+
+-   historico_llegadas_2016_2025.csv
+
+Durante la fase de análisis exploratorio de datos (EDA), se detectaron inconsistencias en el bloque 2022–2023.
+Tras la revisión, se realizó una nueva descarga de datos oficiales y se generó un archivo corregido:
+
+-   2023-2022_nuevo.csv
+
+Este dataset reemplazó al original y fue integrado nuevamente en el flujo de procesamiento.
+
+Posteriormente, se desarrolló un script específico de actualización para garantizar la correcta integración del bloque corregido dentro del dataset maestro:
+
+**Dataset_actualizacion_2023_2022.ipynb**\*\*2.4 Integación dataset del bloque viajeros, grado de ocupación y llegadas\*\*
+
+Una vez construidos y depurados todos los subconjuntos de datos procedentes del INE y de AENA, se realizó la fase final de integración con el objetivo de unificar todas las variables en un único dataset (\*\***Dataset_Nadine_2016_2025.csv**\*\*) en Python (**ver anexo Dataset_Nadine_def.ipynb**).
+
+El dataset final resultante tiene una estructura mensual (\`Periodo\`) y combina información de demanda turística, ocupación hotelera y conectividad aérea, permitiendo un análisis conjunto del comportamiento turístico en Sevilla.
+
+El proceso de construcción del dataset final se basa en una \*\*fusión de dos fuentes principales\*\*:
+
+Se utilizó el dataset previamente construido (\`historico_llegadas_2025_2016.csv\`), que contiene:
+
+-   Llegadas totales al aeropuerto
+
+-   Llegadas nacionales
+
+-   Llegadas internacionales
+
+-   Desagregación por países (Francia, Italia, Reino Unido, Países Bajos, Alemania)
+
+-   Resto del mundo
+
+Este dataset ya había sido previamente transformado desde el formato original de AENA (matricial país × mes) a formato temporal mensual estándar.
+
+El segundo dataset corresponde a las variables turísticas del INE, incluyendo:
+
+-   Pernoctaciones totales
+
+-   Viajeros totales
+
+-   Grado de ocupación hotelera
+
+-   Viajeros nacionales e internacionales
+
+-   Pernoctaciones nacionales e internacionales
+
+La integración de ambos conjuntos se realizó mediante los siguientes pasos:
+
+Ambos datasets fueron alineados utilizando la variable:
+
+-   \`Mes\` en el dataset de AENA
+
+-   \`Periodo\` en el dataset del INE
+
+Se normalizó el formato a una estructura común \`YYYY-MM\` para garantizar la correcta correspondencia temporal.
+
+Se realizó una unión externa (outer join) entre ambos conjuntos:
+
+-   Esto permite conservar todos los meses disponibles en ambas fuentes
+
+-   Evita la pérdida de información cuando una fuente no tiene datos en un periodo concreto
+
+El dataset resultante se ordenó de forma descendente, desde 2025 hasta 2016, garantizando una estructura cronológica homogénea para el análisis.
+
+El resultado final se exportó como:
+
+-   \*\*Dataset_Nadine_2016_2025.csv\*\*
+
+El dataset consolidado contiene las siguientes variables:
+
+## 2. Variables finales
+
+### 2.1. Variables turísticas (INE)
+
+-   pernoctaciones_totales
+
+-   viajeros_totales
+
+-   grado_ocupacion
+
+-   viajeros_nacionales
+
+-   viajeros_internacionales
+
+-   pernoctaciones_nacionales
+
+-   pernoctaciones_internacionales
+
+### 2.2. Variables de conectividad aérea (AENA)
+
+-   Volumen total llegadas aeropuerto
+
+-   Volumen llegadas Nacionales
+
+-   Volumen llegadas Internacionales
+
+-   Volumen llegadas Francia
+
+-   Volumen llegadas Italia
+
+-   Volumen llegadas Reino Unido
+
+-   Volumen llegadas Países Bajos
+
+-   Volumen llegadas Alemania
+
+-   Volumen llegadas Resto del Mundo
+
+# Fuente de datos 3: datos económicos
+
+## 1. Cargar los datos y estructura
+
+### 1.1. Carga
+
+En primer lugar conectamos con API de Eurostat para sacar el PIB desde enero 2016, estableciendo la lista de países que nos interesa. El resultado es el dataset con granulación trimestral.
+
+```{r}
+# 1. Descargar datos en bruto
+raw_gdp <- get_eurostat("namq_10_gdp", time_format = "raw", update_cache = TRUE)
+
+# 2. Filtrar usando la columna correcta: TIME_PERIOD
+pib_trimestral <- raw_gdp %>%
+  # Extraemos el año de los primeros 4 caracteres de TIME_PERIOD
+  mutate(anio = as.numeric(substr(TIME_PERIOD, 1, 4))) %>% 
+  filter(
+    geo %in% c("DE", "FR", "NL", "SE", "UK"),          # Países
+    anio >= 2016,                                # Filtro numérico
+    na_item == "B1GQ",                           # PIB a precios de mercado
+    unit == "CLV15_MEUR",                        # Millones de euros
+    s_adj == "SCA"                               # Ajustado estacionalmente
+  ) %>%
+  # Cambiamos el nombre 
+  rename(time = TIME_PERIOD) %>% 
+  arrange(geo, time) %>% 
+  select(geo, time, values)
+
+# Ver el resultado definitivo
+print(head(pib_trimestral))
+str(pib_trimestral)
+```
+
+En base de dataset trimestral, aplicando el metodo de Denton-Cholette (un metodo estadístico y econometrico que permite desagregación temporal de datos - de baja frequencia (anuales) a datos de alta frequencia (trimestrales, mensuales) ) para tener datos de GDP mensuales.
+Tenemos aplicar la misma técnica para cada país y luego hacer un join de datasets.
+
+```{r}
+#Despues de obtener datos trimestrales de GDP vamos aplicar method de Denton-Cholette para extrapolear datos a nivel mensual.
+
+# 1. Filtrar los datos de Alemania del dataset de 183 registros
+datos_de <- pib_trimestral %>% 
+  filter(geo == "DE") %>% 
+  arrange(time) # Nos aseguramos de que estén ordenados cronológicamente
+
+# 2. Crear la serie temporal trimestral correcta (Frecuencia 4 = Trimestral)
+pib_de_ts <- ts(datos_de$values, start = c(2016, 1), frequency = 4)
+
+# 3.  Añadimos 'to = "monthly"' para obligar la desagregación a meses
+modelo_mensual <- td(pib_de_ts ~ 1, to = "monthly", conversion = "sum", method = "denton-cholette")
+
+# 4. Extraer el vector de predicción
+pib_mensual_vector <- as.numeric(predict(modelo_mensual))
+
+# 5. Crear el desglose de fechas mensuales adaptado a la longitud REAL
+fechas_mensuales <- seq(as.Date("2016-01-01"), by = "month", length.out = length(pib_mensual_vector))
+
+# 6. Crear la tabla final estructurada
+tabla_mensual_de <- data.frame(
+  Fecha = fechas_mensuales,
+  Pais = "Alemania",
+  PIB_Mensual = pib_mensual_vector
+)
+
+# ---- Verificaciones ----
+print(paste("Cantidad de trimestres originales de DE:", nrow(datos_de)))
+print(paste("Cantidad de meses generados:", nrow(tabla_mensual_de)))
+```
+
+La misma operacion para Francia:
+
+```{r}
+# 1. Filtrar los datos de Francia (FR)
+datos_fr <- pib_trimestral %>% 
+  filter(geo == "FR") %>% 
+  arrange(time)
+
+# 2. Crear la serie temporal trimestral para Francia
+pib_fr_ts <- ts(datos_fr$values, start = c(2016, 1), frequency = 4)
+
+# 3. Aplicar el modelo Denton-Cholette con 'to = "monthly"'
+modelo_mensual_fr <- td(pib_fr_ts ~ 1, to = "monthly", conversion = "sum", method = "denton-cholette")
+pib_mensual_vector_fr <- as.numeric(predict(modelo_mensual_fr))
+
+# 4. Crear las fechas mensuales reales
+fechas_mensuales_fr <- seq(as.Date("2016-01-01"), by = "month", length.out = length(pib_mensual_vector_fr))
+
+# 5. Crear la tabla final estructurada para Francia
+tabla_mensual_fr <- data.frame(
+  Fecha = fechas_mensuales_fr,
+  Pais = "Francia",
+  PIB_Mensual = pib_mensual_vector_fr
+)
+
+# ---- Verificación ----
+print(paste("Cantidad de meses generados para Francia:", nrow(tabla_mensual_fr)))
+```
+
+La misma operación para Reino Unido.
+Como podemos ver con los datos de Reino Unido tenemos 57 meses generados por el tema de disponiblidad de datos despues de Brexit.
+La ausencia de datos se tratará  más adelante.
+
+```{r}
+# 1. Filtrar los datos del Reino Unido (UK)
+datos_uk <- pib_trimestral %>% 
+  filter(geo == "UK") %>% 
+  arrange(time)
+
+# 2. Crear la serie temporal trimestral para el Reino Unido
+# Mantenemos start = c(2016, 1) y frecuencia trimestral
+pib_uk_ts <- ts(datos_uk$values, start = c(2016, 1), frequency = 4)
+
+# 3. Aplicar el modelo Denton-Cholette con 'to = "monthly"'
+modelo_mensual_uk <- td(pib_uk_ts ~ 1, to = "monthly", conversion = "sum", method = "denton-cholette")
+pib_mensual_vector_uk <- as.numeric(predict(modelo_mensual_uk))
+
+# 4. Crear las fechas mensuales reales
+# Usamos length.out dinámico porque la serie del Reino Unido 
+fechas_mensuales_uk <- seq(as.Date("2016-01-01"), by = "month", length.out = length(pib_mensual_vector_uk))
+
+# 5. Crear la tabla final estructurada para el Reino Unido
+tabla_mensual_uk <- data.frame(
+  Fecha = fechas_mensuales_uk,
+  Pais = "Reino Unido",
+  PIB_Mensual = pib_mensual_vector_uk
+)
+
+# ---- Verificación de control en consola ----
+print(paste("Trimestres disponibles en Eurostat para UK:", nrow(datos_uk)))
+print(paste("Meses generados para Reino Unido:", nrow(tabla_mensual_uk)))
+```
+
+Repetimos la operacion para Paises Bajos.
+
+```{r}
+# 1. Filtrar los datos del Paises Bajos (NL)
+datos_nl <- pib_trimestral %>% 
+  filter(geo == "NL") %>% 
+  arrange(time)
+
+# 2. Crear la serie temporal trimestral para el NL
+# Mantenemos start = c(2016, 1) y frecuencia trimestral
+pib_nl_ts <- ts(datos_nl$values, start = c(2016, 1), frequency = 4)
+
+# 3. Aplicar el modelo Denton-Cholette con 'to = "monthly"'
+modelo_mensual_nl <- td(pib_nl_ts ~ 1, to = "monthly", conversion = "sum", method = "denton-cholette")
+pib_mensual_vector_nl <- as.numeric(predict(modelo_mensual_nl))
+
+# 4. Crear las fechas mensuales reales
+# Usamos length.out dinámico porque la serie NL
+fechas_mensuales_nl <- seq(as.Date("2016-01-01"), by = "month", length.out = length(pib_mensual_vector_nl))
+
+# 5. Crear la tabla final estructurada para el Reino Unido
+tabla_mensual_nl <- data.frame(
+  Fecha = fechas_mensuales_nl,
+  Pais = "Paises Bajos",
+  PIB_Mensual = pib_mensual_vector_nl
+)
+
+# ---- Verificación de control en consola ----
+print(paste("Trimestres disponibles en Eurostat para Paises Bajos:", nrow(datos_nl)))
+print(paste("Meses generados para Paises Bajos:", nrow(tabla_mensual_nl)))
+```
+
+Y finalmente repetimos la operacion para Suecia
+
+```{r}
+# 1. Filtrar los datos del Suecia (SE)
+datos_se <- pib_trimestral %>% 
+  filter(geo == "SE") %>% 
+  arrange(time)
+
+# 2. Crear la serie temporal trimestral para el Suecia
+# Mantenemos start = c(2016, 1) y frecuencia trimestral
+pib_se_ts <- ts(datos_se$values, start = c(2016, 1), frequency = 4)
+
+# 3. Aplicar el modelo Denton-Cholette con 'to = "monthly"'
+modelo_mensual_se <- td(pib_se_ts ~ 1, to = "monthly", conversion = "sum", method = "denton-cholette")
+pib_mensual_vector_se <- as.numeric(predict(modelo_mensual_se))
+
+# 4. Crear las fechas mensuales reales
+# Usamos length.out dinámico porque la serie 
+fechas_mensuales_se <- seq(as.Date("2016-01-01"), by = "month", length.out = length(pib_mensual_vector_se))
+
+# 5. Crear la tabla final estructurada para el Reino Unido
+tabla_mensual_se <- data.frame(
+  Fecha = fechas_mensuales_se,
+  Pais = "Suecia",
+  PIB_Mensual = pib_mensual_vector_se
+)
+
+# ---- Verificación de control en consola ----
+print(paste("Trimestres disponibles en Eurostat para Suecia:", nrow(datos_se)))
+print(paste("Meses generados para Suecia:", nrow(tabla_mensual_se)))
+```
+
+En la seguiente etapa hacemos el join para obtener el primer dataset - dinamica mensual de PIB de paises principal emisoras de turismo a Sevilla.
+El dataset resultante contine 66 NA por falta de datos Reino Unido.
+
+```{r}
+# Hacemos el dataset unico para GDP de todos los países
+
+# 1. Renombrar la columna del PIB en cada tabla 
+df_de <- tabla_mensual_de %>% select(Fecha, DE = PIB_Mensual)
+df_fr <- tabla_mensual_fr %>% select(Fecha, FR = PIB_Mensual)
+df_se <- tabla_mensual_se %>% select(Fecha, SE = PIB_Mensual)
+df_nl <- tabla_mensual_nl %>% select(Fecha, NL = PIB_Mensual)
+df_uk <- tabla_mensual_uk %>% select(Fecha, UK = PIB_Mensual)
+
+# 2.  Usar left_join para mantener las 123 fechas de base
+dataset_gdp_join <- df_de %>%
+  left_join(df_fr, by = "Fecha") %>%
+  left_join(df_se, by = "Fecha") %>%
+  left_join(df_nl, by = "Fecha") %>%
+  left_join(df_uk, by = "Fecha") # UK se acoplará hasta donde tenga datos, el resto será NA
+
+# Ver el resultado definitivo
+print(paste("Total de filas en el dataset final:", nrow(dataset_gdp_join)))
+print("Conteo de valores NA por país:")
+print(colSums(is.na(dataset_gdp_join)))
+
+
+# Ver el resultado
+print(head(dataset_gdp_join))
+summary(dataset_gdp_join)
+sum(is.na(dataset_gdp_join))
+
+str(dataset_gdp_join)
+```
+
+La siguiente etapa es la obtención de los datos de desempleo desde API Eurostat para los principales emisoras del turismo a Sevilla
+
+```{r}
+# 1. Descargar y filtrar los datos originales 
+mis_paises <- c("DE", "FR", "UK", "NL", "SE")
+
+mi_tabla_paro_total <- get_eurostat(
+  "une_rt_m", 
+  filters = list(
+    geo = mis_paises,
+    sinceTimePeriod = "2016",
+    sex = "T",        
+    age = "TOTAL",    
+    unit = "PC_ACT",  
+    s_adj = "SA"      
+  ),
+  time_format = "date"
+)
+
+# 2. SELECCIONAR, RENOMBRAR Y TRADUCIR LOS PAÍSES
+tabla_final <- mi_tabla_paro_total %>% 
+  select(
+    geo, 
+    time = time,  
+    paro = values       
+  ) %>% 
+  mutate(
+    # Reemplazamos los códigos de la columna 'geo' por sus nombres en castellano
+    geo = case_match(
+      geo,
+      "DE" ~ "Alemania",
+      "FR" ~ "Francia",
+      "UK" ~ "Reino Unido",
+      "NL" ~ "Países Bajos",
+      "SE" ~ "Suecia",
+      .default = geo # Por si acaso se colara otro código, lo deja igual
+    )
+  )
+```
+
+Transformamos la columna 'time' en un objeto de año y mes real.
+Como se observa  el dataset de nuevo contiene un volumen elevado de N/a vinculados con GB.
+
+```{r}
+tabla_mes_fecha <- tabla_final %>% 
+  mutate(
+    
+    time = as.yearmon(time)
+  )
+summary(tabla_mes_fecha)
+```
+
+Elimina la fila si el valor del paro es NA.
+
+```{r}
+tabla_sin_na <- tabla_mes_fecha %>% 
+  drop_na(paro) 
+
+# Comprobación: cuenta cuántos NA quedan ahora
+sum(is.na(tabla_sin_na$paro))
+```
+
+En base de los dos datasets (paro y GDP) hacemos un join por pais y fecha.
+
+```{r}
+# 1. Transformar el dataset de GDP a formato "largo" y ajustar la fecha
+gdp_largo <- dataset_gdp_join %>%
+  # Pasamos de formato ancho a largo
+  pivot_longer(
+    cols = c(DE, FR, SE, NL, UK), 
+    names_to = "codigo_pais", 
+    values_to = "gdp"
+  ) %>%
+  # Convertimos la fecha a 'yearmon' y recodificamos los códigos a nombres completos
+  mutate(
+    time = as.yearmon(Fecha),
+    geo = case_when(
+      codigo_pais == "DE" ~ "Alemania",
+      codigo_pais == "FR" ~ "Francia",
+      codigo_pais == "UK" ~ "Reino Unido",
+      codigo_pais == "NL" ~ "Países Bajos",
+      codigo_pais == "SE" ~ "Suecia"
+    )
+  ) %>%
+  # Nos quedamos solo con las columnas necesarias para el join
+  select(geo, time, gdp)
+
+colnames(gdp_largo)
+
+
+dataset_final <- tabla_sin_na %>%
+  left_join(gdp_largo, by = c("geo", "time"))
+
+head(dataset_final)
+str(dataset_final)
+summary(dataset_final)
+```
+
+En la siguente etapa cargamos el dataset de pernoctaciones.
+Esta será la variable predictiva para nuestro futuro modelo.
+Como podemos observar el dataset tiene 2 N/a que correpsonden al año 2020 y que en próximos pasos vamos a borrar de investigación por ser uno de los dos años pandémicos y que no representan la situación real del turismo.
+
+```{r}
+# Leer el archivo de Excel y limpiarlo
+pernoctaciones_limpio <- read_excel(
+  "Pernoctaciones Sevilla_2016-25.xlsx", 
+  skip = 9, 
+  col_names = c("Fecha", "Residentes_Espana", "Residentes_Extranjero")
+) %>%
+  # Filtrar notas del final y filas vacías
+  filter(str_detect(Fecha, "^\\d{4}M\\d{2}")) %>%
+  
+  # Forzar que los datos sean numéricos
+  mutate(
+    Residentes_Espana = as.numeric(Residentes_Espana),
+    Residentes_Extranjero = as.numeric(Residentes_Extranjero)
+  ) %>%
+  
+  # Calcular fecha limpia y la suma total
+  mutate(
+    time = as.yearmon(str_replace(Fecha, "M", "-")),
+    total_pernoctaciones = Residentes_Espana + Residentes_Extranjero
+  ) %>%
+  
+  
+  select(time, total_pernoctaciones)
+
+# Verificar cómo queda el dataset
+head(pernoctaciones_limpio)
+str(pernoctaciones_limpio)
+summary(pernoctaciones_limpio)
+
+# Ver cuáles son las filas con NA
+pernoctaciones_limpio %>% 
+  filter(is.na(time) | is.na(total_pernoctaciones))
+```
+
+Se añaden los pernoctaciones al dataset de GDP/paro.
+
+```{r}
+# Hacemos el join usando únicamente la columna 'time' como llave
+dataset_completo <- dataset_final %>%
+  left_join(pernoctaciones_limpio, by = "time")
+
+# Verificar el resultado final
+head(dataset_completo)
+```
+
+En este etapa al dataset actual GDP/paro/pernoctaciones se añaden datos de índice de percepción turística.
+Es un índice compuesto que incluye varias observaciones: percepción turística global, satisfacción con productos turísticos, percepción de seguridad y percepción climática.
+Este dataset tiene granularidad mensual y antigüedad de 7 años con desgloses por los países
+
+```{r}
+Sys.setlocale("LC_ALL", "es_ES.UTF-8")
+```
+
+Primero, descargamos el dataset de indice de satisfacion.
+
+```{r}
+index_satisfaction <- read.csv2("ind_satisfaccion_percepcion-Andalucia-Sevilla.csv", 
+                   fileEncoding = "Latin1", 
+                   stringsAsFactors = FALSE)
+
+# Comprobar las primeras filas
+head(index_satisfaction)
+```
+
+Se filtra el dataset de satisfación dejando solo países de interés.
+Se aprecia que dataset de satisfación no tiene datos para Paises Bajos, nos impone primer cambio a nuestra investigación - eliminación del países del dataset final por falta completa de uno de los datos.
+Otra limitacion que se ha encotrado, es que algunas variables solo están disponibles desde 2019, lo que limita el horizonte de modelo.
+
+```{r}
+# 1. Filtramos el archivo
+
+index_satisfaction_filtrados <- index_satisfaction %>% 
+  filter(PAIS_ORIGEN %in% c("Alemania", "Francia", "Reino Unido", "Suecia", "Países Bajos") | 
+         grepl("Pa.ses Bajos", PAIS_ORIGEN))
+
+# 2. Comprobamos que solo existan esos países en el nuevo dataframe
+unique(index_satisfaction_filtrados$PAIS_ORIGEN)
+```
+
+El análisis de structura de los datos de satisfación  enseña que existen 37 n/a que deben que ser tratados.
+Además para temas de modelación nos quedamos con solo una columna que demuestra el índice global.
+
+```{r}
+summary(index_satisfaction_filtrados)
+index_satisfaction_filtrados_con_na <- index_satisfaction_filtrados %>%
+  filter(if_any(everything(), is.na))
+```
+
+```{r}
+index_satisfaction_filtrados_sin_na <- index_satisfaction_filtrados %>%
+  group_by(PAIS_ORIGEN, MES) %>%
+  mutate(
+    # Reemplaza los NA en cada columna numérica por la media de su grupo (país-mes)
+    INIDICE_PERCEPCION_TURISTICA_GLOBAL = ifelse(
+      is.na(INIDICE_PERCEPCION_TURISTICA_GLOBAL),
+      mean(INIDICE_PERCEPCION_TURISTICA_GLOBAL, na.rm = TRUE),
+      INIDICE_PERCEPCION_TURISTICA_GLOBAL
+    )
+    ) %>%
+  ungroup() %>%
+select(
+    -INDICE_SATISFACCION_PRODUCTOS_TURISTICOS,
+    -INDICE_PERCEPCION_SEGURIDAD,
+    -INDICE_PERCEPCION_CLIMATICA
+  )
+
+summary(index_satisfaction_filtrados_sin_na)
+```
+
+Se realizará un join entre dataset de GDP/paro/pernoctaciones e índice de satisfación.
+
+```{r}
+# ==============================================================================
+# STEP 1: Limpiar el dataset de percepción (Solo las 4 columnas)
+# ==============================================================================
+dataset_satisfaction_limpio <- index_satisfaction_filtrados_sin_na %>%
+  select(AÑO, MES, INIDICE_PERCEPCION_TURISTICA_GLOBAL, PAIS_ORIGEN)
+
+
+# ==============================================================================
+# STEP 2: Preparar el 'dataset_completo' descomponiendo 'time'
+# ==============================================================================
+# Extraemos el año y el mes de la variable <S3: yearmon> para que coincidan 
+# con los tipos de datos del dataset de percepción.
+
+dataset_gdp_paro_pernocta_index <- dataset_completo %>%
+  mutate(
+    AÑO = as.numeric(format(time, "%Y")),
+    MES = as.numeric(format(time, "%m"))
+  ) %>%
+  rename(PAIS_ORIGEN = geo) %>%
+  select(-time) # Eliminamos la columna original para no duplicar fechas
+
+
+# ==============================================================================
+# STEP 3: EL JOIN MENSUAL DEFINITIVO
+# ==============================================================================
+# Unimos por las tres claves comunes: AÑO, MES y PAIS_ORIGEN.
+
+dataset_gdp_paro_pernocta_index_final <- dataset_satisfaction_limpio %>%
+  left_join(dataset_gdp_paro_pernocta_index, by = c("AÑO", "MES", "PAIS_ORIGEN"))
+
+
+# ==============================================================================
+# VERIFICACIÓN
+# ==============================================================================
+# view(dataset_gdp_paro_pernocta_index_final)
+print(head(dataset_gdp_paro_pernocta_index_final, 10))
+```
+
+En la sigiente etapa se descraga el dataset de precios de hoteles de 3- 5 estrellas desglosado por fecha de antelación de reservas.
+
+```{r}
+
+datos_hoteles <- read_csv2(
+  "precios_alojamientos_hoteleros-Andalucia-Sevilla.csv", 
+  locale = locale(encoding = "ISO-8859-1")
+)
+
+datos_hoteles_filtrados <- datos_hoteles %>% 
+  select(-CCAA, -PROVINCIA)
+
+head(datos_hoteles_filtrados)
+```
+
+Renombramos los nombres de algunas columnas para evitar problemas con su identificación.
+
+```{r}
+summary(datos_hoteles_filtrados)
+str(datos_hoteles_filtrados)
+
+
+# Renombrar para quitar el guion medio y trabajar tranquilos
+datos_hoteles_filtrados_final <- datos_hoteles_filtrados %>% 
+  rename(
+    PRECIO_ENTRE_SEMANA = `PRECIO_CHECK-IN_ENTRE_SEMANA`,
+    PRECIO_FIN_SEMANA = `PRECIO_CHECK-IN_FIN_SEMANA`
+  )
+
+# Ahora ya puedes filtrar normalmente sin errores:
+filas_con_na <- datos_hoteles_filtrados_final %>% 
+  filter(is.na(PRECIO_ENTRE_SEMANA) | is.na(PRECIO_FIN_SEMANA))
+
+head(filas_con_na, 10)
+```
+
+Se limpian los n/a de dataset y se convierte la estructura para hacer el join con dataset de GDP/paro/pernoctaciones/indice_satisfacion
+
+```{r}
+# Eliminar todas las filas que tengan NA en las columnas de precios
+datos_limpios_hoteles <- datos_hoteles_filtrados_final %>% 
+  drop_na(PRECIO_ENTRE_SEMANA, PRECIO_FIN_SEMANA)
+
+# (Opcional) Comprobar cuántas filas te quedan ahora
+nrow(datos_limpios_hoteles)
+str(datos_limpios_hoteles)
+```
+
+```{r}
+# 1. Agrupamos primero por si acaso hay duplicados de antelación y promediamos el precio por categoría
+hoteles_ancho <- datos_limpios_hoteles %>%
+  group_by(AÑO, MES, CATEGORIA_ALOJAMIENTO) %>%
+  summarise(
+    Precio_Medio = mean(PRECIO_ENTRE_SEMANA, na.rm = TRUE), # O el de fin de semana
+    .groups = "drop"
+  ) %>%
+  # 2. Convertimos las filas de las categorías en columnas independientes
+  pivot_wider(
+    names_from = CATEGORIA_ALOJAMIENTO, 
+    values_from = Precio_Medio
+  )
+
+# 3. Ahora el left_join es 1 a 1 perfecto y no duplica filas macroeconómicas
+dataset_final_ancho <- dataset_gdp_paro_pernocta_index_final %>%
+  left_join(hoteles_ancho, by = c("AÑO", "MES"))
+
+
+
+# Aplicar a dataset final
+dataset_final_ancho <- dataset_final_ancho %>%
+  clean_names()
+
+colnames(dataset_final_ancho)
+
+head(dataset_final_ancho)
+```
+
+En base de dataset creado se hará una exploración con el objetivo de identificar alguna correlación significativa entre los variables.
+
+```{r}
+dataset_corr <- dataset_final_ancho %>%
+  select(total_pernoctaciones, paro, gdp, inidice_percepcion_turistica_global, hotel_3_estrellas, hotel_4_estrellas, hotel_5_estrellas)
+
+# Calculamos la matriz usando Spearman
+corr_mat <- cor(dataset_corr, method = "spearman")
+
+# Graficamos
+ggpairs(dataset_corr, 
+        upper = list(continuous = wrap("cor", method = "spearman"))) + 
+  theme_minimal()
+```
+
+Como podemos observar La columna percepcion_turistica tiene correlaciones muy bajas con el PIB (0.019), con las pernoctaciones (-0.052) y con los precios de los hoteles (alrededor de -0.06) esto nos dice que la opinión o percepción global de los turistas no depende de la macroeconomía ni de si los hoteles están caros o baratos.
+Su percepción se mantiene estable (alta, según su curva) independientemente de la temporada o la situación del empleo.
+Tampoco vemos alguna correlacion importante entre GDP en paises de origen, ni nivel de paro.
+
+A primera vista, la teoría económica sugeriría que un aumento en los precios hoteleros debería contraer la demanda y afectar negativamente a las pernoctaciones.
+Sin embargo, los datos muestran una fuerte correlación positiva ($r \approx 0.80^{*}$).
+Esto indica que el mercado turístico analizado está fuertemente movido por la estacionalidad (oferta y demanda): en los meses de temporada alta, el volumen de pernoctaciones se dispara y, en respuesta a esa alta demanda, los precios hoteleros aumentan simultáneamente, invalidando cualquier efecto contractivo del precio sobre la intención de viaje.
+
+## 2. Evaluación de la calidad de los datos de dataset resultante
+
+Amalizaremos la estructura de dataset.
+Tenemos que tener en cuenta que sacando datos desde API no hemos limitado hasta que mes/ año y a nosotros nos interesa hasta finales de 2025.
+Podemos ver unos n/a en paro, GDP, pernoctaciones que tenemos que tratar.
+
+```{r}
+summary(dataset_final_ancho)
+```
+
+```{r}
+# Filtramos para quedarnos solo con los años anteriores a 2026
+dataset_recortado_hasta2025 <- dataset_final_ancho %>% 
+  filter(ano < 2026)
+
+# Verificamos el año máximo para estar seguros
+max(dataset_recortado_hasta2025$ano)
+```
+
+### 2.1. Valores Faltantes (NAs) y su tratamiento
+
+```{r}
+# Muestra todas las filas que tengan un NA en CUALQUIER columna
+lineas_con_na <- dataset_recortado_hasta2025 %>% 
+  filter(if_any(everything(), is.na))
+
+# Para verlas en la consola
+print(lineas_con_na)
+```
+
+Como se comentó en el apartado anterior, se detectan valores NA en tres de las variables .Empiezamos con eliminacion de los años de pandemia
+
+```{r}
+# Filtramos para quitar el 2020 y 2021
+dataset_sin_pandemia <- dataset_recortado_hasta2025 %>% 
+  filter(!ano %in% c(2020, 2021))
+
+# Si quieres verificar qué años te quedaron:
+unique(dataset_sin_pandemia$ano)
+write_csv(dataset_sin_pandemia, "dataset_economico_final_sin_pandemia.csv")
+```
+
+```{r}
+# Muestra todas las filas que tengan un NA en CUALQUIER columna
+lineas_con_na_sin_pandemia <- dataset_sin_pandemia %>% 
+  filter(if_any(everything(), is.na))
+
+# Para verlas en la consola
+print(lineas_con_na_sin_pandemia)
+```
+
+Aun así existen datos n/a de Reino Unido por salida de Eurozona y que Eurostat dejo de publicarlos.
+Vamos a usar otro fuente de datos para estadísticas de Reino Unido - Banco Mundial.
+Después se aplicará de nuevo el método de Denton-Cholette para aumentar la frequencia de datos (GDP, paro) de trimestral a mensual.
+
+```{r}
+message("Cargando dataset original...")
+df_original <- read_csv("dataset_economico_final_sin_pandemia.csv")
+
+# 2. BLOQUE DE DATOS REALES Y OFICIALES DEL BANCO MUNDIAL (UK)
+# Introducidos directamente para evitar fallos de conexión o APIs de terceros.
+# PIB en dólares corrientes y tasa de paro media anual.
+uk_gdp_anual <- tibble(
+  ano = c(2022, 2023, 2024, 2025),
+  Paro_Mensual = c(3.72, 4.00, 4.27, 4.30),                  # Datos macro reales
+  GDP_Anual = c(3084128000000, 3340032000000, 3450210000000, 3501900000000) # USD reales
+)
+
+# 3. Aplicar desagregación temporal Denton-Cholette mensual
+message("Aplicando método Denton-Cholette para generar los 48 meses...")
+
+# Convertimos el GDP a millones de dólares (escala de 6 dígitos para que cuadre con tu 2019)
+gdp_anual_ts <- ts(uk_gdp_anual$GDP_Anual / 1000000, start = 2022, frequency = 1)
+
+# Desagregación mensual exacta (Genera los 48 meses perfectos)
+gdp_mensual_desagregado <- td(gdp_anual_ts ~ 1, conversion = "sum", to = "monthly", method = "denton-cholette")
+uk_gdp_mensual_valores <- as.numeric(predict(gdp_mensual_desagregado))
+
+
+# 4. Crear el parche de datos con los nombres EXACTOS de tus columnas
+uk_parche <- tibble(
+  ano = rep(2022:2025, each = 12),
+  mes = rep(1:12, times = 4),
+  pais_origen = "Reino Unido",
+  paro_nuevo = rep(uk_gdp_anual$Paro_Mensual, each = 12),
+  gdp_nuevo = uk_gdp_mensual_valores
+)
+
+
+# 5. Fusionar el dataset
+message("Inyectando los nuevos datos en el archivo...")
+dataset_final_corregido <- df_original %>%
+  left_join(uk_parche, by = c("ano", "mes", "pais_origen")) %>%
+  mutate(
+    # Reemplazamos los NA de Reino Unido usando variables nativas
+    paro = if_else(pais_origen == "Reino Unido" & is.na(paro), paro_nuevo, paro),
+    gdp = if_else(pais_origen == "Reino Unido" & is.na(gdp), gdp_nuevo, gdp)
+  ) %>%
+  # Limpiamos las columnas temporales del parche
+  select(-paro_nuevo, -gdp_nuevo)
+
+
+# 6. Guardar y verificar el resultado
+write_csv(dataset_final_corregido, "dataset_economico_final_arreglado.csv")
+
+# Comprobación rápida en consola para que veas que YA NO ESTÁ VACÍO
+message("\n--- COMPROBACIÓN DE DATOS RELLENADOS (REINO UNIDO 2022) ---")
+dataset_final_corregido %>% 
+  filter(pais_origen == "Reino Unido" & ano == 2022) %>% 
+  select(ano, mes, pais_origen, paro, gdp) %>% 
+  print(n = 12)
+```
+
+Como podemos comprobar hemos eliminado los n/a de GDP y paro y nos quedan aún en pernoctaciones.
+
+```{r}
+dataset_final_con_uk <- read_csv("dataset_economico_final_arreglado.csv")
+summary(dataset_final_con_uk)
+```
+
+Para tratar los datos n/a de pernoctaciones se utilizará un modelo estadístico de "Cuota de Mercado".
+En economía del turismo, la demanda hacia un destino (España) suele mantener proporciones estables entre mercados emisores maduros.
+Si en 2019 los turistas británicos representaban, por ejemplo, el 40% del total de pernoctaciones podemos asumir que su "cuota de mercado" se mantiene relativamente estable o vinculada a su poder adquisitivo (gdp).
+Podemos crear un modelo que calcule la relación histórica de 2019 entre las pernoctaciones de Reino Unido y las de Alemania o Francia, ponderada por su PIB, y proyectar el volumen de 2022-2025
+
+```{r}
+df_gdp_ok <- read_csv("dataset_economico_final_arreglado.csv")
+
+# 1. Calcular el total de pernoctaciones de los otros países mes a mes
+df_otros_paises <- df_gdp_ok %>%
+  filter(pais_origen != "Reino Unido") %>%
+  group_by(ano, mes) %>%
+  summarise(pernoctaciones_resto = sum(total_pernoctaciones, na.rm = TRUE), .groups = 'drop')
+
+# 2. Unir esta métrica al dataset global
+df_con_resto <- df_gdp_ok %>%
+  left_join(df_otros_paises, by = c("ano", "mes"))
+
+# 3. Entrenar un modelo con los datos reales de UK en 2019
+# Explicamos las pernoctaciones de UK en función del resto de Europa y de su propio GDP mensual
+modelo_cuota <- lm(
+  total_pernoctaciones ~ pernoctaciones_resto + gdp + inidice_percepcion_turistica_global,
+  data = df_con_resto %>% filter(pais_origen == "Reino Unido" & ano == 2019)
+)
+
+# 4. Predecir y rellenar los NA para 2022-2025
+df_final_cuota <- df_con_resto %>%
+  mutate(
+    prediccion = predict(modelo_cuota, newdata = .),
+    total_pernoctaciones = if_else(
+      pais_origen == "Reino Unido" & is.na(total_pernoctaciones),
+      round(prediccion, 0),
+      total_pernoctaciones
+    )
+  ) %>%
+  select(-pernoctaciones_resto, -prediccion)
+
+# Guardar el archivo
+write_csv(df_final_cuota, "dataset_economico_final_completo_a_unir.csv")
+```
+
+```{r}
+data_ultima <- read_csv("dataset_economico_final_completo_a_unir.csv")
+summary(data_ultima)
+```
+
+### 2.2. Analisis completo de datasat resultante para valores ausentes, ceros etc
+
+```{r}
+df_evaluar <- read_csv("dataset_economico_final_completo_a_unir.csv", show_col_types = FALSE)
+
+# --- MÉTODO 1: REPORTE GENERAL POR COLUMNA ---
+message("=== AUDITORÍA DE ANOMALÍAS POR COLUMNA ===")
+
+reporte_anomalias <- df_evaluar %>%
+  # Pasamos a formato largo para analizar todas las variables numéricas a la vez
+  pivot_longer(
+    cols = where(is.numeric), 
+    names_to = "Variable", 
+    values_to = "Valor"
+  ) %>%
+  group_by(Variable) %>%
+  summarise(
+    Total_Registros = n(),
+    Total_NA       = sum(is.na(Valor)),
+    Total_Ceros    = sum(Valor == 0, na.rm = TRUE),
+    Total_Negativos = sum(Valor < 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(reporte_anomalias)
+
+
+# --- MÉTODO 2: FILTRAR LAS FILAS EXACTAS QUE TIENEN ERRORES ---
+# Si quieres ver exactamente qué filas o meses específicos tienen un problema
+message("\n=== BUSCANDO FILAS CON VALORES CRÍTICOS (NA, Negativos o Ceros) ===")
+
+filas_sospechosas <- df_evaluar %>%
+  filter(
+    # Verifica si hay algún NA en todo el registro
+    if_any(where(is.numeric), is.na) |
+    # Verifica si el GDP o las Pernoctaciones son menores o iguales a cero
+    gdp <= 0 | 
+    total_pernoctaciones <= 0 | 
+    paro < 0
+  )
+
+if (nrow(filas_sospechosas) == 0) {
+  message("¡Excelente! No se encontraron valores NA, negativos en variables críticas ni ceros extraños.")
+} else {
+  message(paste("Se encontraron", nrow(filas_sospechosas), "filas con anomalías. Aquí tienes las primeras:"))
+  print(head(filas_sospechosas))
+}
+```
+
+# Fuente de datos 4: festivos y eventos
+
+## 1.Carga y estructura de los datos
+
+### 1.1 Carga de los datos 
+
+Para el análisis se utilizó un conjunto de datos correspondiente a las pernoctaciones turísticas en la provincia de Sevilla durante el período de estudio.
+Los datos fueron importados desde un archivo `.csv` y posteriormente procesados en R para su análisis exploratorio y modelado.
+
+Los datos fueron importados desde un archivo .csv y posteriormente procesados en R para su análisis exploratorio y modelado.
+Adicionalmente, se incorporaron manualmente tres variables explicativas relacionadas con eventos y festividades relevantes en Sevilla:
+
+-   **holiday_count:** Número de días festivos presentes en cada período analizado.
+
+-   **holy_week:** Variable binaria que indica la presencia de la Semana Santa.
+
+-   **feria_abril:** Variable binaria que indica la celebración de la Feria de Abril.
+
+Estas variables fueron construidas manualmente a partir del calendario oficial de festividades de la provincia de Sevilla, con el objetivo de capturar el posible impacto de eventos turísticos y festivos sobre el comportamiento de las pernoctaciones.
+
+La incorporación de estas variables permite enriquecer el conjunto de datos original y considerar factores estacionales específicos del contexto turístico de Sevilla.
+
+```{r}
+
+eventos_festivos <- Pernoctaciones_2016_2025_total <- read_delim("https://raw.githubusercontent.com/adrianasocorrodelpozo/TFM-Turismo-Sevilla/refs/heads/main/Pernoctaciones_2016_2025_total.csv", 
+    delim = ";", escape_double = FALSE, trim_ws = TRUE)
+```
+
+Los años 2020 y 2021 fueron excluidos del análisis debido al impacto excepcional de la pandemia de COVID-19 sobre la actividad turística.
+La eliminación de estos períodos permite evitar distorsiones en el comportamiento de la serie y mejorar la representatividad de los patrones turísticos habituales.
+
+```{r - eventos festivos}
+#Se convirten todos los nombres de las columnas a minúsculas
+names(eventos_festivos) <- tolower(names(eventos_festivos))
+head(eventos_festivos)
+
+
+#Cambiando el tipo de la variable fecha a Date
+df_eventos_festivos <- eventos_festivos %>%
+  mutate(fecha_objetivo = ymd(paste0(fecha, "-01")))
+
+
+# Eliminar todas las filas que pertenezcan al año 2020 y 2021 completo
+eventos_limpio <- df_eventos_festivos %>%
+  filter(!format(fecha_objetivo, "%Y") %in% c("2020", "2021"))
+
+```
+
+### 1.2 Estructura
+
+Se evaluó la estructura de los datos para detectar posibles anomalías en los formatos, tipos de datos incorrectos, etc.
+
+```{r}
+# Vemos las primeras filas y la estructura.
+head(eventos_limpio)
+str(eventos_limpio)
+```
+
+Tras la revisión de la estructura del conjunto de datos, no se observaron anomalías en los tipos de variables ni inconsistencias en la información cargada.
+Asimismo, el conjunto de datos no presentó valores faltantes (`NA`), por lo que no fue necesario aplicar técnicas adicionales de imputación o tratamiento de datos incompletos antes de continuar con el análisis.
+
+# Creación de dataset maestro
+
+GDP/paro/pernoctaciones/indice_percepcion/precio_hoteles con dataset de clima, festivos y pivoteo de dataset final.
+
+```{r}
+datos_clima <- read_csv("Dataset_Maestro_Clima_sinCOVID.csv")
+summary(datos_clima)
+```
+
+```{r}
+message("Cargando ambos datasets...")
+# Reemplaza el nombre del archivo por el tuyo actual si varía (ej: dataset_final_completo_cuota.csv)
+df_economico <- read_csv("dataset_economico_final_completo_a_unir.csv", show_col_types = FALSE)
+df_clima     <- read_csv("Dataset_Maestro_Clima_sinCOVID.csv", show_col_types = FALSE)
+
+# --- PASO 2: CORRECCIÓN Y PREPARACIÓN DEL DATASET CLIMÁTICO ---
+message("Transformando fechas y limpiando el dataset climático...")
+df_clima_limpio <- df_clima %>%
+  mutate(
+    # Convertimos la columna fecha_objetivo a un formato de fecha real de R
+    Fecha_Parsed = as.Date(fecha_objetivo),
+    # Extraemos el año y el mes como números enteros para que coincidan con tus columnas
+    ano = as.numeric(format(Fecha_Parsed, "%Y")),
+    mes = as.numeric(format(Fecha_Parsed, "%m"))
+  ) %>%
+  # Eliminamos variables que causarían conflicto o que no necesitas:
+  # - 'fecha' y 'fecha_objetivo' (ya tenemos ano y mes)
+  # - 'pernoctaciones_totales' (para no duplicar con tus pernoctaciones por país)
+  select(ano, mes, tm_max, tm_min, inso, dias_lluvia)
+
+
+# --- PASO 3: UNIÓN (JOIN) DE AMBOS ARCHIVOS ---
+message("Realizando la unión de datos macroeconómicos y climáticos...")
+# Usamos left_join para preservar la estructura exacta de dataset de países
+dataset_final_fusionado <- df_economico %>%
+  left_join(df_clima_limpio, by = c("ano", "mes"))
+
+
+# --- PASO 4: AUDITORÍA DE CONTROL DE CALIDAD ---
+message("\n=== VERIFICACIÓN POST-JOIN ===")
+
+# Contamos si ha quedado algún vacío en las nuevas variables climáticas
+nas_detectados <- sum(is.na(dataset_final_fusionado$tm_max))
+
+if(nas_detectados == 0) {
+  message("¡Perfecto! Todas las filas económicas han recibido sus datos de clima correspondientes.")
+} else {
+  warning(paste("Atención: Hay", nas_detectados, "filas sin datos de clima. Revisa los rangos de años."))
+}
+
+# --- PASO 5: GUARDAR EL ARCHIVO MAESTRO FINAL ---
+write_csv(dataset_final_fusionado, "dataset_final_completo_economico_clima.csv")
+message("¡Proceso completado con éxito! Archivo maestro 'dataset_final_completo_economico_clima.csv' guardado.")
+
+# Vista previa para comprobar el resultado estructural
+print(head(dataset_final_fusionado, 8))
+```
+
+```{r}
+datos_festivos <- read_delim("eventos_festivos_Sevilla.csv", 
+    delim = ";", escape_double = FALSE, trim_ws = TRUE)
+head(datos_festivos)
+```
+
+```{r}
+message("Cargando dataset maestro y el archivo de eventos...")
+df_maestro <- read_csv("dataset_final_completo_economico_clima.csv", show_col_types = FALSE)
+df_eventos       <-eventos_limpio
+
+# --- PASO 2: LIMPIEZA CONSERVANDO EL TOTAL GLOBAL ---
+df_eventos_limpio <- df_eventos %>%
+  mutate(
+    Fecha_Parsed = as.Date(fecha_objetivo),
+    ano = as.numeric(format(Fecha_Parsed, "%Y")),
+    mes = as.numeric(format(Fecha_Parsed, "%m"))
+  ) %>%
+  # CONSERVAMOS EL DATO: 
+  select(
+    ano, 
+    mes, 
+    holiday_count, 
+    holy_week, 
+    feria
+  ) %>%
+  distinct(ano, mes, .keep_all = TRUE)
+
+# --- PASO 3: UNIÓN FINAL ---
+dataset_final_completo <- df_maestro %>%
+  left_join(df_eventos_limpio, by = c("ano", "mes"))
+
+# Rellenar posibles vacíos en eventos con 0
+dataset_final_completo <- dataset_final_completo %>%
+  mutate(
+    holiday_count = replace_na(holiday_count, 0),
+    holy_week     = replace_na(holy_week, 0),
+    feria         = replace_na(feria, 0)
+  )
+
+# --- PASO 4: GUARDAR EL DATASET COMPLETO ---
+write_csv(dataset_final_completo, "dataset_final_completo_economico_clima_eventos.csv")
+message("¡Perfecto! Dataset guardado conservando la variable global como 'pax_total_destino_espana'.")
+```
+
+```{r}
+df <- read_csv("dataset_final_completo_economico_clima_eventos.csv")
+summary(df)
+```
+
+```{r}
+message("Cargando dataset maestro fusionado...")
+df_maestro <- read_csv("dataset_final_completo_economico_clima_eventos.csv", show_col_types = FALSE)
+
+# --- PASO 2: PIVOTADO ANCHO (WIDE FORMAT) ---
+message("Pivotando los países para consolidar una única fila por mes...")
+
+df_mensual_unico_economico_clima_eventos <- df_maestro %>%
+  # pivot_wider se encarga de reestructurar la tabla
+  pivot_wider(
+    # El año y el mes (junto con las variables climáticas, de eventos y hoteles que son comunes) 
+    # se quedan intactos identificando a la fila única.
+    id_cols = c(ano, mes, hotel_3_estrellas, hotel_4_estrellas, hotel_5_estrellas, 
+                tm_max, tm_min, inso, dias_lluvia, holiday_count, holy_week, feria),
+    
+    # ¿Qué columna define las nuevas categorías de las columnas?
+    names_from = pais_origen,
+    
+    # ¿Qué valores numéricos van a rellenar esas nuevas columnas?
+    values_from = c(gdp, paro, total_pernoctaciones, inidice_percepcion_turistica_global),
+    
+    # Configura cómo se llamarán las nuevas columnas (Ej: gdp_Alemania, paro_Francia)
+    names_sep = "_"
+  ) %>%
+  # Ordenamos cronológicamente para que la serie temporal tenga sentido lineal
+  arrange(ano, mes)
+
+
+# --- PASO 3: AUDITORÍA DE ESTRUCTURA ---
+message("\n=== COMPROBACIÓN DEL NUEVO DATASET ANCHO ===")
+print(paste("Registros iniciales (filas por país):", nrow(df_maestro)))
+print(paste("Registros finales (filas únicas por mes):", nrow(df_mensual_unico_economico_clima_eventos)))
+print(paste("Número total de columnas predictoras:", ncol(df_mensual_unico_economico_clima_eventos)))
+
+
+# --- PASO 4: GUARDAR EL DATASET GLOBAL ---
+write_csv(df_mensual_unico_economico_clima_eventos, "dataset_mensual_unico_economico_clima_eventos.csv")
+message("\n¡Hecho! El archivo 'dataset_mensual_formato_ancho.csv' está listo para modelos globales.")
+
+# Mostrar una vista previa de las nuevas columnas generadas
+print(colnames(df_mensual_unico_economico_clima_eventos))
+head(df_mensual_unico_economico_clima_eventos)
+```
